@@ -5,8 +5,24 @@
 #include <fstream>
 #include <iostream>
 
-Chip8::Chip8() {
-    // Reset or initialize state if needed
+Chip8::Chip8() : rng(std::random_device{}()) {
+    // rng seeded with random_device; nothing else to init
+    // (members use default member initializers).
+}
+
+void Chip8::reset() {
+    memory.fill(0);
+    registers.fill(0);
+    index_register = 0;
+    program_counter = 0x200;
+    stack.fill(0);
+    stack_pointer = 0;
+    delay_timer = 0;
+    sound_timer = 0;
+    gfx.fill(0);
+    keypad.fill(0);
+    draw_flag = false;
+    // NOTE: quirk flags and rng state are preserved across reset.
 }
 
 void Chip8::load_fonts() {
@@ -36,13 +52,13 @@ void Chip8::load_fonts() {
     }
 }
 
-void Chip8::load_rom(const char* filename) {
+bool Chip8::load_rom(const char* filename) {
     // 1. Open the file in binary mode and start at the end (ate) to get size
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
 
     if (!file.is_open()) {
         std::cerr << "Failed to open ROM file: " << filename << "\n";
-        return;
+        return false;
     }
 
     // 2. Get the size of the file
@@ -56,21 +72,29 @@ void Chip8::load_rom(const char* filename) {
     // Available space for ROM is 4096 - 512 = 3584 bytes.
     if (size > (4096 - 0x200)) {
         std::cerr << "Error: ROM is too large to fit in memory!\n";
-        return;
+        return false;
     }
 
     // 5. Read the file directly into a temporary buffer or straight into memory
     // Here we read directly into our memory array starting at index 0x200 (512)
     if (file.read(reinterpret_cast<char*>(&memory[0x200]), size)) {
         std::cout << "Successfully loaded ROM: " << filename << " (" << size << " bytes)\n";
+        return true;
     } else {
         std::cerr << "Error: Failed to read ROM file into memory.\n";
+        return false;
     }
 
     // file stream automatically closes when it goes out of scope
 }
 
 void Chip8::emulate_cycle() {
+    // Guard against PC running off memory (each opcode is 2 bytes).
+    if (static_cast<size_t>(program_counter) + 1 >= memory.size()) {
+        std::cerr << "Error: PC out of bounds: 0x" << std::hex << program_counter << "\n";
+        return;
+    }
+
     // 1. Fetch Opcode (Big-endian: high byte first, shifted left by 8, ORed with low byte)
     uint16_t opcode = (memory[program_counter] << 8) | memory[program_counter + 1];
 
@@ -87,7 +111,14 @@ void Chip8::emulate_cycle() {
                     draw_flag = true;
                     break;
                 case 0x00EE: // Return from subroutine
+                    if (stack_pointer == 0) {
+                        std::cerr << "Error: stack underflow on RET\n";
+                        return;
+                    }
                     program_counter = stack[--stack_pointer];
+                    break;
+                default:
+                    // 0NNN: SYS addr — ignored on modern interpreters.
                     break;
             }
             break;
@@ -97,6 +128,10 @@ void Chip8::emulate_cycle() {
             break;
 
         case 0x2000: // 0x2NNN: Call subroutine at NNN
+            if (stack_pointer >= stack.size()) {
+                std::cerr << "Error: stack overflow on CALL\n";
+                return;
+            }
             stack[stack_pointer] = program_counter;
             stack_pointer++;
             program_counter = opcode & 0x0FFF;
@@ -174,14 +209,17 @@ void Chip8::emulate_cycle() {
 
                 case 0x1: // 8XY1: Set VX = VX | VY (Bitwise OR)
                     registers[x] |= registers[y];
+                    if (reset_vf_on_logic) registers[0xF] = 0;
                     break;
 
                 case 0x2: // 8XY2: Set VX = VX & VY (Bitwise AND)
                     registers[x] &= registers[y];
+                    if (reset_vf_on_logic) registers[0xF] = 0;
                     break;
 
                 case 0x3: // 8XY3: Set VX = VX ^ VY (Bitwise XOR)
                     registers[x] ^= registers[y];
+                    if (reset_vf_on_logic) registers[0xF] = 0;
                     break;
 
                 case 0x4: // 8XY4: Set VX = VX + VY, set VF = carry
@@ -202,8 +240,12 @@ void Chip8::emulate_cycle() {
                     }
                     break;
 
-                case 0x6: // 8XY6: Set VX = VX SHR 1 (Shift Right)
-                    // If the least-significant bit of VX is 1, then VF is set to 1, otherwise 0. Then VX is divided by 2.
+                case 0x6: // 8XY6: SHR 1 (Shift Right)
+                    // Modern (CHIP-48): shift VX. Original (COSMAC VIP): VX = VY, then shift.
+                    if (use_original_shift) {
+                        registers[x] = registers[y];
+                    }
+                    // If the least-significant bit of the source is 1, VF = 1, else 0.
                     registers[0xF] = registers[x] & 0x1;
                     registers[x] >>= 1;
                     break;
@@ -216,8 +258,12 @@ void Chip8::emulate_cycle() {
                     }
                     break;
 
-                case 0xE: // 8XYE: Set VX = VX SHL 1 (Shift Left)
-                    // If the most-significant bit of VX is 1, then VF is set to 1, otherwise 0. Then VX is multiplied by 2.
+                case 0xE: // 8XYE: SHL 1 (Shift Left)
+                    // Modern (CHIP-48): shift VX. Original (COSMAC VIP): VX = VY, then shift.
+                    if (use_original_shift) {
+                        registers[x] = registers[y];
+                    }
+                    // If the most-significant bit of the source is 1, VF = 1, else 0.
                     registers[0xF] = (registers[x] & 0x80) >> 7;
                     registers[x] <<= 1;
                     break;
@@ -235,16 +281,18 @@ void Chip8::emulate_cycle() {
             break;
         }
 
-        case 0xB000: { // BNNN: Jump to address NNN + V0
+        case 0xB000: { // BNNN / BXNN: Jump to NNN + V0 (or NNN + VX on Super-CHIP)
+            uint8_t x = (opcode & 0x0F00) >> 8;
             uint16_t nnn = opcode & 0x0FFF;
-            program_counter = registers[0] + nnn;
+            uint16_t base = use_vx_jump ? registers[x] : registers[0];
+            program_counter = (base + nnn) & 0x0FFF;
             break;
         }
 
         case 0xC000: { // Random: 0xCXNN
             uint8_t x = (opcode & 0x0F00) >> 8;
             uint8_t nn = opcode & 0x00FF;
-            registers[x] = rand() & nn;
+            registers[x] = static_cast<uint8_t>(rand_dist(rng) & nn);
             break;
         }
 
@@ -258,14 +306,25 @@ void Chip8::emulate_cycle() {
             registers[0xF] = 0;
 
             for(int row = 0; row < n; row++) {
+                if (static_cast<size_t>(index_register) + static_cast<size_t>(row) >= memory.size()) {
+                    std::cerr << "Error: sprite read OOB at I=0x" << std::hex << index_register << "\n";
+                    break;
+                }
                 uint8_t sprite_byte = memory[index_register + row];
                 uint8_t col = 0;
                 for (uint8_t mask = 0x80; mask != 0; mask >>= 1) {
                     if (sprite_byte & mask) {
-                        // Wrap screen coordinates if sprite goes past edges
-                        int target_x = (x_coord + col) % 64;
-                        int target_y = (y_coord + row) % 32;
-                        int pixel_index = target_x + (target_y * 64);
+                        int sx = x_coord + col;
+                        int sy = y_coord + row;
+                        if (clip_sprites) {
+                            // Clip: skip pixels past the edges.
+                            if (sx >= 64 || sy >= 32) { ++col; continue; }
+                        } else {
+                            // Wrap: coordinates wrap around the screen.
+                            sx %= 64;
+                            sy %= 32;
+                        }
+                        int pixel_index = sx + (sy * 64);
 
                         // Check for collision (if screen pixel is already 1)
                         if (gfx[pixel_index] == 1) {
@@ -285,14 +344,16 @@ void Chip8::emulate_cycle() {
 
         case 0xE000: { // Skip if key: 0xEX9E, 0xEXA1
             uint8_t x = (opcode & 0x0F00) >> 8;
+            // VX can hold 0-255 but keypad has 16 keys; mask to 0-F to avoid OOB.
+            uint8_t key = registers[x] & 0x0F;
             switch (opcode & 0x00FF) {
                 case 0x9E: // Skip if key corresponding to value in VX is pressed
-                    if (keypad[registers[x]] == 1) {
+                    if (keypad[key] == 1) {
                         program_counter += 2;
                     }
                     break;
                 case 0xA1: // Skip if key corresponding to value in VX is NOT pressed
-                    if (keypad[registers[x]] == 0) {
+                    if (keypad[key] == 0) {
                         program_counter += 2;
                     }
                     break;
@@ -319,7 +380,8 @@ void Chip8::emulate_cycle() {
                     break;
 
                 case 0x1E:
-                    index_register += registers[x];
+                    // I wraps within 12-bit address space.
+                    index_register = (index_register + registers[x]) & 0x0FFF;
                     break;
 
                 case 0x0A: {
@@ -342,11 +404,16 @@ void Chip8::emulate_cycle() {
                 
                 case 0x29: {
                     // Each font character is 5 bytes long, starting at memory address 0x050
-                    index_register = 0x050 + (x * 5);
+                    // Use the *value* in VX (the hex digit), not the register index x.
+                    index_register = 0x050 + (registers[x] * 5);
                     break;
                 }
 
                 case 0x33: {
+                    if (static_cast<size_t>(index_register) + 2 >= memory.size()) {
+                        std::cerr << "Error: FX33 write OOB at I=0x" << std::hex << index_register << "\n";
+                        break;
+                    }
                     uint8_t value = registers[x];
                     memory[index_register] = value / 100;
                     memory[index_register + 1] = (value / 10) % 10;
@@ -355,15 +422,29 @@ void Chip8::emulate_cycle() {
                 }
 
                 case 0x55: {
+                    if (static_cast<size_t>(index_register) + x >= memory.size()) {
+                        std::cerr << "Error: FX55 write OOB at I=0x" << std::hex << index_register << "\n";
+                        break;
+                    }
                     for (int i = 0; i <= x; i++) {
                         memory[index_register + i] = registers[i];
+                    }
+                    if (increment_i_on_load_store) {
+                        index_register = (index_register + x + 1) & 0x0FFF;
                     }
                     break;
                 }
 
                 case 0x65: {
+                    if (static_cast<size_t>(index_register) + x >= memory.size()) {
+                        std::cerr << "Error: FX65 read OOB at I=0x" << std::hex << index_register << "\n";
+                        break;
+                    }
                     for (int i = 0; i <= x; i++) {
                         registers[i] = memory[index_register + i];
+                    }
+                    if (increment_i_on_load_store) {
+                        index_register = (index_register + x + 1) & 0x0FFF;
                     }
                     break;
                 }
@@ -381,8 +462,7 @@ void Chip8::emulate_cycle() {
             break;
     }
 
-    // 3. Update Timers (typically ticked at 60Hz outside or inside the loop)
-    if (delay_timer > 0) --delay_timer;
-    if (sound_timer > 0) --sound_timer;
+    // NOTE: timers are decremented at 60Hz in main.cpp, not here.
+    // Decrementing here would tick them once per *instruction* (~600Hz).
 }
 

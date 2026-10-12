@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <array>
+#include <random>
 
 class Chip8 {
 public:
@@ -24,7 +25,24 @@ public:
     
     bool draw_flag = false;                 // Set when screen needs rendering
 
+    // Quirks (defaults = modern CHIP-48 behavior, most ROMs expect this):
+    //  shift: false = shift VX in place; true = VX = VY then shift (COSMAC VIP).
+    bool use_original_shift = false;
+    //  logic VF reset: true = 8XY1/2/3 reset VF to 0 (CHIP-48); false = leave VF (VIP).
+    bool reset_vf_on_logic = true;
+    //  load/store: true = FX55/FX65 increment I by X+1 (VIP); false = leave I (CHIP-48).
+    bool increment_i_on_load_store = false;
+    //  jump: false = BNNN jumps to NNN + V0; true = BXNN jumps to NNN + VX (Super-CHIP).
+    bool use_vx_jump = false;
+    //  sprites: false = wrap around edges; true = clip at edges.
+    bool clip_sprites = false;
+
     void load_fonts();
-    void load_rom(const char* filename);
+    void reset();
+    bool load_rom(const char* filename);
     void emulate_cycle();
+
+private:
+    std::mt19937 rng;
+    std::uniform_int_distribution<uint16_t> rand_dist{0, 255};
 };
